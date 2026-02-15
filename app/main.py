@@ -29,32 +29,63 @@ class DNSHeader:
         return bytes(header)
 
 @dataclass
+class DNSName:
+    labels: list[str]
+
+    def to_bytes(self) -> bytes:
+        name_bytes = bytearray()
+        for label in self.labels:
+            name_bytes.append(len(label))
+            name_bytes.extend(label.encode("utf-8"))
+        name_bytes.append(0)
+        return bytes(name_bytes)
+
+@dataclass
+class DNSQuestion:
+    qname: DNSName
+    qtype: int
+    qclass: int
+
+    def to_bytes(self) -> bytes:
+        response = self.qname.to_bytes()
+        response += self.qtype.to_bytes(2, byteorder="big")
+        response += self.qclass.to_bytes(2, byteorder="big")
+
+        return response
+@dataclass
 class UDPMessage:
     headers: DNSHeader
-    question: str = ""
+    questions: list[DNSQuestion] = []
     answer: str = ""
     authority: str = ""
     additional: str = ""
 
-    def to_bytes(self) -> bytes:
-        return self.headers.to_bytes()
+    def to_bytes(self, headers: DNSHeader, questions: list[DNSQuestion]) -> bytes:
+        response = headers.to_bytes()
+        if questions:
+            for question in questions:
+                response += question.to_bytes()
+
+        return response
     
-    def generate_response(self) -> None:
-        self.headers.id = 1234
-        self.headers.qr = 1
-        self.headers.opcode = 0
-        self.headers.aa = 0
-        self.headers.tc = 0
-        self.headers.rd = 0
-        self.headers.ra = 0
-        self.headers.z = 0
-        self.headers.rcode = 0
-        self.headers.qdcount = 0
-        self.headers.ancount = 0
-        self.headers.nscount = 0
-        self.headers.arcount = 0
+    def generate_response(self) -> bytes:
+        response_headers = DNSHeader(
+            id=self.headers.id,
+            qr=1,
+            opcode=self.headers.opcode,
+            aa=0,
+            tc=0,
+            rd=0,
+            ra=0,
+            z=0,
+            rcode=0,
+            qdcount=self.headers.qdcount,
+            ancount=0,
+            nscount=0,
+            arcount=0,
+        )
         
-        return self.to_bytes()
+        return self.to_bytes(response_headers, self.questions)
 
 def extract_headers(header: bytes) -> DNSHeader:
     return DNSHeader(
@@ -73,17 +104,51 @@ def extract_headers(header: bytes) -> DNSHeader:
         arcount=int.from_bytes(header[10:12], byteorder="big"),
     )
 
+def extract_question(buf: bytes, question_count: int) -> DNSQuestion:
+    questions: list[DNSQuestion] = []
+
+    while len(questions) < question_count:
+        labels = []
+        offset = 0
+        while True:
+            length = buf[offset]
+            if length == 0:
+                break
+            offset += 1
+            labels.append(buf[offset:offset + length].decode("utf-8"))
+            offset += length
+
+        qtype = int.from_bytes(buf[offset:offset + 2], byteorder="big")
+        offset += 2
+        qclass = int.from_bytes(buf[offset:offset + 2], byteorder="big")
+
+        questions.append(
+            DNSQuestion(
+                qname=DNSName(labels=labels),
+                qtype=qtype,
+                qclass=qclass,
+            )
+        )
+    
+    return questions
+
 def parse_request(buf: bytes) -> UDPMessage:
     header = buf[:12]
     headers = extract_headers(header)
 
+    remaining_buf = buf[12:]
+    question = None
+
+    if headers.qdcount > 0:
+        question = extract_question(remaining_buf, headers.qdcount)
+
     return UDPMessage(
-        headers=headers
+        headers=headers,
+        questions=question if question else []
     )
 
 
 def main():
-
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_socket.bind(("127.0.0.1", 2053))
     
