@@ -52,10 +52,11 @@ class DNSQuestion:
         response += self.qclass.to_bytes(2, byteorder="big")
 
         return response
+
 @dataclass
 class UDPMessage:
     headers: DNSHeader
-    questions: list[DNSQuestion] = []
+    questions: list[DNSQuestion]
     answer: str = ""
     authority: str = ""
     additional: str = ""
@@ -70,9 +71,9 @@ class UDPMessage:
     
     def generate_response(self) -> bytes:
         response_headers = DNSHeader(
-            id=self.headers.id,
+            id=1234,
             qr=1,
-            opcode=self.headers.opcode,
+            opcode=0,
             aa=0,
             tc=0,
             rd=0,
@@ -106,13 +107,14 @@ def extract_headers(header: bytes) -> DNSHeader:
 
 def extract_question(buf: bytes, question_count: int) -> DNSQuestion:
     questions: list[DNSQuestion] = []
+    offset = 0
 
     while len(questions) < question_count:
         labels = []
-        offset = 0
         while True:
             length = buf[offset]
             if length == 0:
+                offset += 1
                 break
             offset += 1
             labels.append(buf[offset:offset + length].decode("utf-8"))
@@ -121,6 +123,7 @@ def extract_question(buf: bytes, question_count: int) -> DNSQuestion:
         qtype = int.from_bytes(buf[offset:offset + 2], byteorder="big")
         offset += 2
         qclass = int.from_bytes(buf[offset:offset + 2], byteorder="big")
+        offset += 2
 
         questions.append(
             DNSQuestion(
