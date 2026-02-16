@@ -102,15 +102,15 @@ class UDPMessage:
     
     def generate_response(self) -> bytes:
         response_headers = DNSHeader(
-            id=1234,
+            id=self.headers.id,
             qr=1,
-            opcode=0,
+            opcode=self.headers.opcode,
             aa=0,
             tc=0,
-            rd=0,
+            rd=self.headers.rd,
             ra=0,
             z=0,
-            rcode=0,
+            rcode=0 if self.headers.opcode == 0 else 4,
             qdcount=self.headers.qdcount,
             ancount=len(self.answer) if self.answer else 0,
             nscount=0,
