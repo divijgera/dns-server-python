@@ -1,6 +1,9 @@
 import socket
 from dataclasses import dataclass
 
+IP_ADDRESS = "8.8.8.8"
+TTL_SECONDS = 60
+
 @dataclass
 class DNSHeader:
     id: int
@@ -52,21 +55,49 @@ class DNSQuestion:
         response += self.qclass.to_bytes(2, byteorder="big")
 
         return response
+    
+@dataclass
+class ResourceRecord:
+    name: DNSName
+    type: int
+    class_: int
+    ttl: int
+    rdata: bytes
+    rdlength: int
+
+    def to_bytes(self) -> bytes:
+        response = self.name.to_bytes()
+        response += self.type.to_bytes(2, byteorder="big")
+        response += self.class_.to_bytes(2, byteorder="big")
+        response += self.ttl.to_bytes(4, byteorder="big")
+        response += self.rdlength.to_bytes(2, byteorder="big")
+        response += self.rdata
+
+        return response
 
 @dataclass
 class UDPMessage:
     headers: DNSHeader
     questions: list[DNSQuestion]
-    answer: str = ""
+    answer: list[ResourceRecord]
     authority: str = ""
     additional: str = ""
 
-    def to_bytes(self, headers: DNSHeader, questions: list[DNSQuestion]) -> bytes:
+    def to_bytes(
+            self,
+            headers: DNSHeader,
+            questions: list[DNSQuestion],
+            answer: list[ResourceRecord]
+        ) -> bytes:
         response = headers.to_bytes()
         if questions:
             for question in questions:
                 response += question.to_bytes()
-
+        
+        if answer:
+            for record in answer:
+                response += record.to_bytes()
+    
         return response
     
     def generate_response(self) -> bytes:
@@ -81,12 +112,12 @@ class UDPMessage:
             z=0,
             rcode=0,
             qdcount=self.headers.qdcount,
-            ancount=0,
+            ancount=len(self.answer) if self.answer else 0,
             nscount=0,
             arcount=0,
         )
         
-        return self.to_bytes(response_headers, self.questions)
+        return self.to_bytes(response_headers, self.questions, self.answer)
 
 def extract_headers(header: bytes) -> DNSHeader:
     return DNSHeader(
@@ -135,19 +166,38 @@ def extract_question(buf: bytes, question_count: int) -> DNSQuestion:
     
     return questions
 
+def generate_answer(questions: list[DNSQuestion]) -> list[ResourceRecord]:
+    answer = []
+    for question in questions:
+        answer.append(
+            ResourceRecord(
+                name=question.qname,
+                type=question.qtype,
+                class_=question.qclass,
+                ttl=TTL_SECONDS,
+                rdata=socket.inet_aton(IP_ADDRESS),
+                rdlength=4
+            )
+        )
+
+    return answer
+
 def parse_request(buf: bytes) -> UDPMessage:
     header = buf[:12]
     headers = extract_headers(header)
 
     remaining_buf = buf[12:]
-    question = None
+    questions = None
+    answer = None
 
     if headers.qdcount > 0:
-        question = extract_question(remaining_buf, headers.qdcount)
+        questions = extract_question(remaining_buf, headers.qdcount)
+        answer = generate_answer(questions)
 
     return UDPMessage(
         headers=headers,
-        questions=question if question else []
+        questions=questions if questions else [],
+        answer=answer if answer else []
     )
 
 
