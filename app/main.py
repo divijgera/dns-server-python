@@ -139,23 +139,40 @@ def extract_headers(header: bytes) -> DNSHeader:
 def extract_question(buf: bytes, question_count: int) -> DNSQuestion:
     questions: list[DNSQuestion] = []
     offset = 0
+    offset_to_label: dict[int, list[str]] = {}
 
     while len(questions) < question_count:
         labels = []
+        is_compressed = False
+        pointer_offset = None
+        start_offset = offset
         while True:
             length = buf[offset]
             if length == 0:
                 offset += 1
                 break
-            offset += 1
-            labels.append(buf[offset:offset + length].decode("utf-8"))
-            offset += length
+            if (length & 0xC0):
+                is_compressed = True
+                pointer_offset = length ^ 0xC0
 
+            offset += 1
+
+            if not is_compressed:
+                labels.append(buf[offset:offset + length].decode("utf-8"))
+                offset += length
+
+        if is_compressed:
+            buffer_pointer_offset = pointer_offset - 12
+            if buffer_pointer_offset in offset_to_label:
+                labels.extend(offset_to_label[buffer_pointer_offset])
+
+        offset_to_label[start_offset] = labels
+        
         qtype = int.from_bytes(buf[offset:offset + 2], byteorder="big")
         offset += 2
         qclass = int.from_bytes(buf[offset:offset + 2], byteorder="big")
         offset += 2
-
+        
         questions.append(
             DNSQuestion(
                 qname=DNSName(labels=labels),
