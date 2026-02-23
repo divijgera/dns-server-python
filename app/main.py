@@ -1,5 +1,6 @@
 import socket
 from dataclasses import dataclass
+import argparse
 
 IP_ADDRESS = "8.8.8.8"
 TTL_SECONDS = 60
@@ -100,7 +101,25 @@ class UDPMessage:
     
         return response
     
+    def generate_answers(self, questions: list[DNSQuestion]) -> list[ResourceRecord]:
+        answer = []
+        for question in questions:
+            answer.append(
+                ResourceRecord(
+                    name=question.qname,
+                    type=question.qtype,
+                    class_=question.qclass,
+                    ttl=TTL_SECONDS,
+                    rdata=socket.inet_aton(IP_ADDRESS),
+                    rdlength=4
+                )
+            )
+
+        return answer
+    
     def generate_response(self) -> bytes:
+        answers = self.answer if self.answer else self.generate_answers(self.questions)
+
         response_headers = DNSHeader(
             id=self.headers.id,
             qr=1,
@@ -112,12 +131,59 @@ class UDPMessage:
             z=0,
             rcode=0 if self.headers.opcode == 0 else 4,
             qdcount=self.headers.qdcount,
-            ancount=len(self.answer) if self.answer else 0,
+            ancount=len(answers) if answers else 0,
             nscount=0,
             arcount=0,
         )
         
-        return self.to_bytes(response_headers, self.questions, self.answer)
+        return self.to_bytes(response_headers, self.questions, answers)
+    
+    def generate_resolver_reponse(self, ip: str, port: int) -> bytes:
+        answers = []
+        forward_header = DNSHeader(
+            id=self.headers.id,
+            qr=0,
+            opcode=0,
+            aa=0,
+            tc=0,
+            rd=1,
+            ra=0,
+            z=0,
+            rcode=0,
+            qdcount=1,
+            ancount=0,
+            nscount=0,
+            arcount=0,
+        )
+
+        for question in self.questions:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(5)
+                forward_bytes = self.to_bytes(forward_header, [question], [])
+                sock.sendto(forward_bytes, (ip, port))
+                response_bytes, _ = sock.recvfrom(512)
+
+                response_message = parse_request(response_bytes)
+                if response_message.headers.rcode == 0 and response_message.answer:
+                    answers.extend(response_message.answer)
+
+        response_headers = DNSHeader(
+            id=self.headers.id,
+            qr=1,
+            opcode=self.headers.opcode,
+            aa=0,
+            tc=0,
+            rd=self.headers.rd,
+            ra=0,
+            z=0,
+            rcode=0 if self.headers.opcode == 0 else 4,
+            qdcount=self.headers.qdcount,
+            ancount=len(answers) if answers else 0,
+            nscount=0,
+            arcount=0,
+        )
+
+        return self.to_bytes(response_headers, self.questions, answers)
 
 def extract_headers(header: bytes) -> DNSHeader:
     return DNSHeader(
@@ -136,37 +202,53 @@ def extract_headers(header: bytes) -> DNSHeader:
         arcount=int.from_bytes(header[10:12], byteorder="big"),
     )
 
-def extract_question(buf: bytes, question_count: int) -> DNSQuestion:
+def read_labels(buffer: bytes, offset: int) -> tuple[list[str], int]:
+    labels = []
+    next_offset = offset
+    jumped = False
+    seen_offsets = set()
+    while True:
+        if offset >= len(buffer):
+            raise ValueError("Offset out of bounds")
+        if offset in seen_offsets:
+            raise ValueError("Loop detected in label pointers")
+        seen_offsets.add(offset)
+
+        length = buffer[offset]
+
+        # Compression pointer: 11xxxxxx xxxxxxxx
+        if (length & 0xC0) == 0xC0:
+            if offset + 1 >= len(buffer):
+                raise ValueError("Truncated compression pointer")
+            pointer = ((length & 0x3F) << 8) | buffer[offset + 1]
+            if not jumped:
+                next_offset = offset + 2
+                jumped = True
+            offset = pointer
+            continue
+
+        # End of name
+        if length == 0:
+            if not jumped:
+                next_offset = offset + 1
+            break
+
+        offset += 1
+        if offset + length > len(buffer):
+            raise ValueError("Truncated DNS label")
+        labels.append(buffer[offset:offset + length].decode("utf-8"))
+        offset += length
+
+    return labels, next_offset
+
+def extract_questions(buf: bytes, offset: int, question_count: int) -> tuple[list[DNSQuestion], int]:
     questions: list[DNSQuestion] = []
-    offset = 0
-    offset_to_label: dict[int, list[str]] = {}
 
     while len(questions) < question_count:
-        labels = []
-        is_compressed = False
-        pointer_offset = None
-        start_offset = offset
-        while True:
-            length = buf[offset]
-            if length == 0:
-                offset += 1
-                break
-            if (length & 0xC0):
-                is_compressed = True
-                pointer_offset = length ^ 0xC0
+        labels, offset = read_labels(buf, offset)
 
-            offset += 1
-
-            if not is_compressed:
-                labels.append(buf[offset:offset + length].decode("utf-8"))
-                offset += length
-
-        if is_compressed:
-            buffer_pointer_offset = pointer_offset - 12
-            if buffer_pointer_offset in offset_to_label:
-                labels.extend(offset_to_label[buffer_pointer_offset])
-
-        offset_to_label[start_offset] = labels
+        if offset + 4 > len(buf):
+            raise ValueError("Truncated question section")
         
         qtype = int.from_bytes(buf[offset:offset + 2], byteorder="big")
         offset += 2
@@ -181,44 +263,66 @@ def extract_question(buf: bytes, question_count: int) -> DNSQuestion:
             )
         )
     
-    return questions
+    return questions, offset
 
-def generate_answer(questions: list[DNSQuestion]) -> list[ResourceRecord]:
-    answer = []
-    for question in questions:
-        answer.append(
+def extract_answers(buf: bytes, offset: int, answer_count: int) -> tuple[list[ResourceRecord], int]:
+    answers: list[ResourceRecord] = []
+    
+    while len(answers) < answer_count:
+        labels, offset = read_labels(buf, offset)
+
+        if offset + 10 > len(buf):
+            raise ValueError("Truncated answer section")
+        
+        qtype = int.from_bytes(buf[offset:offset + 2], byteorder="big")
+        offset += 2
+        qclass = int.from_bytes(buf[offset:offset + 2], byteorder="big")
+        offset += 2
+        ttl = int.from_bytes(buf[offset:offset + 4], byteorder="big")
+        offset += 4
+        rdlength = int.from_bytes(buf[offset:offset + 2], byteorder="big")
+        offset += 2
+
+        if offset + rdlength > len(buf):
+            raise ValueError("Truncated RDATA")
+
+        rdata = buf[offset:offset + rdlength]
+        offset += rdlength
+        
+        answers.append(
             ResourceRecord(
-                name=question.qname,
-                type=question.qtype,
-                class_=question.qclass,
-                ttl=TTL_SECONDS,
-                rdata=socket.inet_aton(IP_ADDRESS),
-                rdlength=4
+                name=DNSName(labels=labels),
+                type=qtype,
+                class_=qclass,
+                ttl=ttl,
+                rdata=rdata,
+                rdlength=rdlength
             )
         )
-
-    return answer
+    
+    return answers, offset
 
 def parse_request(buf: bytes) -> UDPMessage:
     header = buf[:12]
     headers = extract_headers(header)
 
-    remaining_buf = buf[12:]
-    questions = None
-    answer = None
+    offset = 12
+    questions = []
+    answers = []
 
     if headers.qdcount > 0:
-        questions = extract_question(remaining_buf, headers.qdcount)
-        answer = generate_answer(questions)
+        questions, offset = extract_questions(buf, offset, headers.qdcount)
+    
+    if headers.ancount > 0:
+        answers, offset = extract_answers(buf, offset, headers.ancount)
 
     return UDPMessage(
         headers=headers,
-        questions=questions if questions else [],
-        answer=answer if answer else []
+        questions=questions,
+        answer=answers
     )
 
-
-def main():
+def main(args):
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_socket.bind(("127.0.0.1", 2053))
     
@@ -226,8 +330,11 @@ def main():
         try:
             buf, source = udp_socket.recvfrom(512)
             request = parse_request(buf)
-    
-            response = request.generate_response()
+            if args.resolver:
+                ip, port = args.resolver.split(":")
+                response = request.generate_resolver_reponse(ip, int(port))
+            else:    
+                response = request.generate_response()
     
             udp_socket.sendto(response, source)
         except Exception as e:
@@ -236,4 +343,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="A simple DNS server that listens for UDP requests")
+    parser.add_argument("--resolver", type=str)
+    args = parser.parse_args()
+    main(args)
